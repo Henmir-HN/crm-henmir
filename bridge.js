@@ -201,14 +201,14 @@ app.post('/api/crm/chats/:chatId/enable_bot', (req, res) => {
 
 
 async function callCrmTool(functionName, args) {
-    // ✨ AQUÍ ESTÁ EL CAMBIO: Rellenamos el mapa de traducción.
     const endpointMap = {
         'search_vacancies_tool': '/api/bot_tools/vacancies',
-        'validate_registration_tool': '/api/bot_tools/validate_registration'
+        'validate_registration_tool': '/api/bot_tools/validate_registration',
+        // ✨ NUEVA HERRAMIENTA AÑADIDA AL MAPA ✨
+        'get_all_active_vacancies_tool': '/api/bot_tools/all_active_vacancies' 
     };
     const endpoint = endpointMap[functionName];
 
-    // Esta línea ahora funcionará correctamente.
     if (!endpoint) {
         throw new Error(`Herramienta desconocida: ${functionName}`);
     }
@@ -229,33 +229,27 @@ async function callCrmTool(functionName, args) {
     
     const responseData = await response.json();
     console.log(`Datos recibidos de app.py: Se recibieron ${responseData.length} registros.`);
-    console.log(`Primer registro recibido:`, responseData[0] || 'Ninguno');
     console.log(`--- FIN LLAMADA HERRAMIENTA ---\n`);
     
     return responseData;
 }
 
 
+// EN bridge.js, REEMPLAZA LA FUNCIÓN app.post('/api/whatsauto_reply', ...) COMPLETA
 
 app.post('/api/whatsauto_reply', async (req, res) => {
-    const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body;
-    const sender = body.sender || req.query.sender;
-    const message = body.message || req.query.message;
-    if (!sender || !message) {
-        return res.status(400).json({ error: "Faltan datos sender/message" });
-    }
+    const body = req.body;
+    const sender = body.sender;
+    const message = body.message;
+    if (!sender || !message) return res.status(400).json({ error: "Faltan datos" });
 
     const chatId = `${sender.replace(/\D/g, '')}@c.us`;
 
     db.get('SELECT bot_active FROM conversations WHERE chat_id = ?', [chatId], async (err, row) => {
-        if (err || (row && row.bot_active === 0)) {
-            return res.json({ reply: "" });
-        }
+        if (err || (row && row.bot_active === 0)) return res.json({ reply: "" });
 
         try {
-            const settingsRows = await new Promise((resolve, reject) => {
-                db.all("SELECT key, value FROM settings", [], (err, rows) => err ? reject(err) : resolve(rows));
-            });
+            const settingsRows = await new Promise((resolve, reject) => db.all("SELECT key, value FROM settings", [], (err, rows) => err ? reject(err) : resolve(rows)));
             const settings = settingsRows.reduce((acc, row) => ({ ...acc, [row.key]: row.value }), {});
             settings.model = settings.model || 'gpt-4o-mini';
             settings.personality_prompt = settings.personality_prompt || 'Eres un asistente de Henmir.';
@@ -278,55 +272,62 @@ app.post('/api/whatsauto_reply', async (req, res) => {
             ];
 
             const tools = [
-                { type: "function", function: { name: "search_vacancies_tool", description: "Busca vacantes de empleo disponibles en el CRM.", parameters: { type: "object", properties: { city: { type: "string" }, keyword: { type: "string" } } } } },
-                { type: "function", function: { name: "validate_registration_tool", description: "Verifica en el CRM si un candidato se ha registrado recientemente usando su número de identidad.", parameters: { type: "object", properties: { identity: { type: "string" } }, required: ["identity"] } } }
+                { type: "function", function: { name: "search_vacancies_tool", description: "Busca vacantes específicas por ciudad y palabra clave." } },
+                { type: "function", function: { name: "validate_registration_tool", description: "Valida el registro de un usuario por su identidad." } },
+                // ✨ NUEVA HERRAMIENTA VIRTUAL PARA LA IA ✨
+                { type: "function", function: { name: "get_all_active_vacancies_tool", description: "Obtiene una lista completa de TODOS los cargos de vacantes disponibles. Úsalo como último recurso si una búsqueda específica no da resultados." } }
             ];
             
             console.log(`[${chatId}] Procesando mensaje: "${message}"`);
-            const initialResponse = await openai.chat.completions.create({
-                model: settings.model,
-                messages: messagesForOpenAI,
-                tools: tools,
-                tool_choice: "auto",
-            });
+            const initialResponse = await openai.chat.completions.create({ model: settings.model, messages: messagesForOpenAI, tools: tools, tool_choice: "auto" });
 
             const responseMessage = initialResponse.choices[0].message;
             const toolCalls = responseMessage.tool_calls;
             let finalReply = "";
 
             if (toolCalls) {
-                console.log(`[${chatId}] IA solicita usar herramienta(s): ${toolCalls.map(tc => tc.function.name).join(', ')}`);
                 messagesForOpenAI.push(responseMessage);
-
-                // ✨ INICIO DEL BUCLE CORREGIDO ✨
-                for (const toolCall of toolCalls) {
-                    const functionName = toolCall.function.name;
-                    const functionArgs = JSON.parse(toolCall.function.arguments);
-                    
-                    const functionResponse = await callCrmTool(functionName, functionArgs);
-                    
-                    // --- LOG DE DEPURACIÓN AÑADIDO ---
-                    console.log(`\n--- ENVIANDO A IA PARA RESPUESTA FINAL ---`);
-                    console.log(`Resultado de la herramienta '${functionName}' que se enviará a OpenAI:`);
-                    console.log(JSON.stringify(functionResponse, null, 2));
-                    console.log(`--- FIN DE DATOS PARA IA ---\n`);
-                    // --- FIN DEL LOG DE DEPURACIÓN ---
-
-                    messagesForOpenAI.push({
-                        tool_call_id: toolCall.id,
-                        role: "tool",
-                        name: functionName,
-                        content: JSON.stringify(functionResponse),
-                    });
-                } // ✨ CIERRE CORRECTO DEL BUCLE 'for' ✨
+                const toolCall = toolCalls[0];
+                const functionName = toolCall.function.name;
+                const functionArgs = JSON.parse(toolCall.function.arguments);
                 
-                console.log(`[${chatId}] Enviando resultados de herramientas a IA para respuesta final.`);
-                const secondResponse = await openai.chat.completions.create({
-                    model: settings.model,
-                    messages: messagesForOpenAI,
-                });
-                finalReply = secondResponse.choices[0].message.content;
+                let toolResult = await callCrmTool(functionName, functionArgs);
+                
+                // --- ✨ INICIO DE LA LÓGICA DEL "PLAN B" ✨ ---
+                if (functionName === 'search_vacancies_tool' && (!toolResult || toolResult.length === 0)) {
+                    console.log(`[${chatId}] Búsqueda inicial fallida. Activando Plan B: búsqueda semántica.`);
+                    
+                    // 1. Obtener la lista completa de vacantes
+                    const allVacancies = await callCrmTool('get_all_active_vacancies_tool', {});
+                    
+                    if (allVacancies && allVacancies.length > 0) {
+                        // 2. Crear un nuevo prompt para la IA pidiendo sugerencias
+                        const semanticPrompt = `La búsqueda del usuario para '${functionArgs.keyword || 'cualquier vacante'}' en '${functionArgs.city || 'cualquier ciudad'}' no encontró resultados directos. Sin embargo, estas son todas las vacantes disponibles en la empresa: [${allVacancies.join(', ')}]. Basado en la intención del usuario, sugiere hasta 3 vacantes de esta lista que sean las más similares o relevantes. Responde directamente al usuario empezando con una frase como 'No encontré una vacante exacta para lo que buscas, pero estas opciones podrían interesarte:'. Si ninguna es remotamente similar, indícalo amablemente.`;
+                        
+                        // Añadimos el resultado de la herramienta fallida
+                        messagesForOpenAI.push({ tool_call_id: toolCall.id, role: "tool", name: functionName, content: JSON.stringify(toolResult) });
+                        // Añadimos el nuevo prompt de sistema/instrucción
+                        messagesForOpenAI.push({ role: "user", content: semanticPrompt });
 
+                        // 3. Hacemos la segunda llamada a OpenAI para que genere la sugerencia
+                        const semanticResponse = await openai.chat.completions.create({
+                            model: settings.model,
+                            messages: messagesForOpenAI,
+                        });
+                        finalReply = semanticResponse.choices[0].message.content;
+
+                    } else {
+                         // Si no hay ninguna vacante en la empresa, dejamos que la IA lo diga
+                         finalReply = "Actualmente no se encontraron vacantes de ningún tipo en el sistema.";
+                    }
+
+                } else {
+                    // --- FLUJO NORMAL (SI LA BÚSQUEDA INICIAL FUNCIONA O ES OTRA HERRAMIENTA) ---
+                    messagesForOpenAI.push({ tool_call_id: toolCall.id, role: "tool", name: functionName, content: JSON.stringify(toolResult) });
+                    const secondResponse = await openai.chat.completions.create({ model: settings.model, messages: messagesForOpenAI });
+                    finalReply = secondResponse.choices[0].message.content;
+                }
+                
             } else {
                 finalReply = responseMessage.content;
             }
@@ -334,15 +335,15 @@ app.post('/api/whatsauto_reply', async (req, res) => {
             console.log(`[${chatId}] Respuesta final: "${finalReply.substring(0, 60)}..."`);
             history.push({ role: 'user', content: message }, { role: 'assistant', content: finalReply });
             conversationHistory[chatId] = history.slice(-20);
-
             res.json({ reply: finalReply });
 
         } catch (error) {
             console.error(`❌ Error en el flujo del chatbot para ${chatId}:`, error);
             res.json({ reply: "Lo siento, estoy teniendo un problema técnico." });
         }
-    }); // ✨ CIERRE CORRECTO DEL 'db.get' ✨
-}); // ✨ CIERRE CORRECTO DEL 'app.post' ✨```
+    });
+});
+
 
 
 // --- 4. LÓGICA DEL PUENTE PARA CRM MANUAL Y ASISTENTE (TU CÓDIGO ORIGINAL MEJORADO) ---
