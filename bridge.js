@@ -12,6 +12,10 @@ const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const OpenAI = require('openai');
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const geminiModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash"}); 
+
 
 const app = express();
 app.use(cors());
@@ -55,6 +59,51 @@ const db = new sqlite3.Database('./whatsapp_chats.db', (err) => {
         value TEXT
     )`);
 });
+
+// EN bridge.js, AGREGA ESTA FUNCIÓN COMPLETA (por ejemplo, antes de la Sección 4)
+
+/**
+ * Analiza un historial de conversación con Gemini para detectar sentimiento, urgencia e incongruencias.
+ * @param {Array<Object>} conversation - El historial de mensajes del chat.
+ * @returns {Promise<Object|null>} - Un objeto con el análisis o null si hay un error.
+ */
+async function analyzeConversationWithGemini(conversation) {
+    if (!process.env.GEMINI_API_KEY) {
+        console.warn("Advertencia: GEMINI_API_KEY no está configurada. Se saltará el análisis de conversación.");
+        return null;
+    }
+    
+    // Formateamos el historial para que Gemini lo entienda
+    const historyForAnalysis = conversation.map(msg => `${msg.from_me ? 'Asesor' : 'Usuario'}: ${msg.body}`).join('\n');
+    
+    const prompt = `
+        Analiza la siguiente conversación de atención al cliente de una agencia de empleos.
+        Evalúa los siguientes puntos y responde estrictamente con un solo objeto JSON, sin texto adicional antes o después.
+        
+        1. "sentiment": clasifícalo como "positivo", "negativo" o "neutro".
+        2. "urgency": clasifícalo como "alta", "media" o "baja". Urgencia alta significa que el usuario necesita ayuda inmediata o está muy frustrado.
+        3. "incongruity": pon 'true' si el usuario parece confundido, da información contradictoria o el bot parece no entenderle. De lo contrario, pon 'false'.
+        4. "summary": un resumen muy corto (máximo 10 palabras) del tema principal de la conversación.
+
+        CONVERSACIÓN:
+        ---
+        ${historyForAnalysis}
+        ---
+    `;
+
+    try {
+        const result = await geminiModel.generateContent(prompt);
+        const response = await result.response;
+        const text = response.text();
+        // Limpiamos la respuesta para asegurarnos de que sea solo el JSON
+        const jsonResponse = text.replace('```json', '').replace('```', '').trim();
+        return JSON.parse(jsonResponse);
+    } catch (error) {
+        console.error("❌ Error al analizar la conversación con Gemini:", error);
+        return null;
+    }
+}
+
 
 // =================================================================
 // --- 4. API PARA LA INTERFAZ DEL CRM (PANEL DE CONTROL Y CHAT) ---
@@ -416,24 +465,66 @@ function initializeWhatsappClient() {
     });
     
     // ARCHIVADO AUTOMÁTICO EN SQLITE
-    const archiveMessage = (msg, fromMe) => {
+
+
+
+    const archiveAndAnalyze = async (msg, fromMe) => {
         const chatId = fromMe ? msg.to : msg.from;
         const sender = fromMe ? 'me' : msg.from;
+
+        // Paso 1: Guardar el mensaje en la base de datos SQLite.
         db.run(`INSERT INTO messages (chat_id, sender, body, timestamp, from_me) VALUES (?, ?, ?, ?, ?)`,
                [chatId, sender, msg.body, msg.timestamp, fromMe]);
         
-        db.run(`INSERT OR IGNORE INTO conversations (chat_id, last_message_timestamp) VALUES (?, ?)`, [chatId, msg.timestamp]);
+        db.run(`INSERT OR IGNORE INTO conversations (chat_id, contact_name, last_message_timestamp) VALUES (?, ?, ?)`, 
+               [chatId, msg._data.notifyName || chatId.split('@')[0], msg.timestamp]);
         db.run(`UPDATE conversations SET last_message_timestamp = ? WHERE chat_id = ?`, [msg.timestamp, chatId]);
+
+        // Paso 2: Después de guardar, analizar la conversación con Gemini.
+        try {
+            // Se recuperan los últimos 6 mensajes para dar contexto.
+            const conversationHistory = await new Promise((resolve, reject) => {
+                db.all('SELECT * FROM messages WHERE chat_id = ? ORDER BY timestamp DESC LIMIT 6', [chatId], (err, rows) => {
+                    if (err) return reject(err);
+                    resolve(rows.reverse()); // Se ordenan cronológicamente.
+                });
+            });
+
+            if (!conversationHistory || conversationHistory.length === 0) return;
+
+            // Se llama a la función de análisis que ya hemos creado.
+            const analysis = await analyzeConversationWithGemini(conversationHistory);
+
+            // Paso 3: Si el análisis tiene resultado y el CRM está conectado, se envía la notificación.
+            if (analysis && crmSocket && crmSocket.readyState === WebSocket.OPEN) {
+                const notification = {
+                    type: 'conversation_analysis',
+                    data: {
+                        chatId: chatId,
+                        contactName: msg._data.notifyName || chatId.split('@')[0],
+                        sentiment: analysis.sentiment,
+                        urgency: analysis.urgency,
+                        incongruity: analysis.incongruity,
+                        summary: analysis.summary
+                    }
+                };
+                crmSocket.send(JSON.stringify(notification));
+                console.log(`[${chatId}] Análisis de Gemini enviado al CRM.`);
+            }
+        } catch (error) {
+            console.error(`❌ Error durante el análisis de la conversación para ${chatId}:`, error);
+        }
     };
 
-    client.on('message', msg => archiveMessage(msg, false));
-    client.on('message_create', msg => { if (msg.fromMe) archiveMessage(msg, true) });
-    
-    client.initialize();
-}
+    // Cuando llega un mensaje nuevo de un usuario.
+    client.on('message', (msg) => {
+        archiveAndAnalyze(msg, false);
+    });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`✅ Servidor Express (para WhatsAuto y CRM Chat) escuchando en http://localhost:${PORT}`);
-    initializeWhatsappClient();
-});
+    // Cuando nosotros enviamos un mensaje (desde el móvil o el CRM manual).
+    client.on('message_create', (msg) => {
+        if (msg.fromMe) {
+            archiveAndAnalyze(msg, true);
+        }
+    })
+};
